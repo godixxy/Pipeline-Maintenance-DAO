@@ -9,14 +9,20 @@
 (define-constant ERR_INSUFFICIENT_FUNDS (err u8))
 (define-constant ERR_INVALID_STATUS (err u9))
 (define-constant ERR_NOT_CONTRACTOR (err u10))
+(define-constant ERR_EMERGENCY_ONLY (err u11))
+(define-constant ERR_NOT_EMERGENCY (err u12))
 
 (define-constant VOTING_PERIOD u144)
+(define-constant EMERGENCY_VOTING_PERIOD u24)
 (define-constant MIN_APPROVAL_THRESHOLD u66)
+(define-constant EMERGENCY_APPROVAL_THRESHOLD u80)
 (define-constant MAX_REPORT_AMOUNT u10000000)
+(define-constant MAX_EMERGENCY_AMOUNT u5000000)
 
 (define-data-var next-report-id uint u1)
 (define-data-var total-treasury uint u0)
 (define-data-var dao-members-count uint u0)
+(define-data-var total-emergency-reports uint u0)
 
 (define-map dao-members principal bool)
 (define-map field-workers principal bool)
@@ -37,7 +43,8 @@
     votes-for: uint,
     votes-against: uint,
     total-voters: uint,
-    payment-completed: bool
+    payment-completed: bool,
+    is-emergency: bool
   }
 )
 
@@ -121,7 +128,8 @@
         votes-for: u0,
         votes-against: u0,
         total-voters: u0,
-        payment-completed: false
+        payment-completed: false,
+        is-emergency: false
       }
     )
     
@@ -230,6 +238,65 @@
   )
 )
 
+(define-public (submit-emergency-report
+  (title (string-ascii 64))
+  (description (string-ascii 256))
+  (location (string-ascii 128))
+  (estimated-cost uint))
+  (let
+    (
+      (report-id (var-get next-report-id))
+      (current-block u1)
+    )
+    (asserts! (default-to false (map-get? field-workers tx-sender)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= estimated-cost MAX_EMERGENCY_AMOUNT) ERR_INVALID_AMOUNT)
+    (asserts! (> estimated-cost u0) ERR_INVALID_AMOUNT)
+    
+    (map-set maintenance-reports report-id
+      {
+        reporter: tx-sender,
+        title: title,
+        description: description,
+        location: location,
+        estimated-cost: estimated-cost,
+        contractor: none,
+        status: "pending",
+        created-at: current-block,
+        voting-deadline: (+ current-block EMERGENCY_VOTING_PERIOD),
+        votes-for: u0,
+        votes-against: u0,
+        total-voters: u0,
+        payment-completed: false,
+        is-emergency: true
+      }
+    )
+    
+    (var-set next-report-id (+ report-id u1))
+    (var-set total-emergency-reports (+ (var-get total-emergency-reports) u1))
+    (ok report-id)
+  )
+)
+
+(define-public (expedite-emergency-approval (report-id uint))
+  (let
+    (
+      (report (unwrap! (map-get? maintenance-reports report-id) ERR_REPORT_NOT_FOUND))
+      (current-block u1)
+      (total-votes (+ (get votes-for report) (get votes-against report)))
+      (approval-percentage (if (> total-votes u0) 
+        (/ (* (get votes-for report) u100) total-votes) u0))
+    )
+    (asserts! (default-to false (map-get? dao-members tx-sender)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-emergency report) ERR_NOT_EMERGENCY)
+    (asserts! (is-eq (get status report) "pending") ERR_INVALID_STATUS)
+    (asserts! (>= approval-percentage EMERGENCY_APPROVAL_THRESHOLD) ERR_NOT_APPROVED)
+    
+    (map-set maintenance-reports report-id 
+      (merge report { status: "approved" }))
+    (ok approval-percentage)
+  )
+)
+
 (define-read-only (get-report (report-id uint))
   (map-get? maintenance-reports report-id)
 )
@@ -268,4 +335,39 @@
     treasury-balance: (var-get total-treasury),
     total-reports: (- (var-get next-report-id) u1)
   }
+)
+
+(define-read-only (is-emergency-report (report-id uint))
+  (match (map-get? maintenance-reports report-id)
+    report (get is-emergency report)
+    false
+  )
+)
+
+(define-read-only (get-emergency-stats)
+  {
+    total-emergency-reports: (var-get total-emergency-reports),
+    emergency-voting-period: EMERGENCY_VOTING_PERIOD,
+    emergency-threshold: EMERGENCY_APPROVAL_THRESHOLD,
+    max-emergency-amount: MAX_EMERGENCY_AMOUNT
+  }
+)
+
+(define-read-only (can-expedite-emergency (report-id uint))
+  (match (map-get? maintenance-reports report-id)
+    report
+      (let
+        (
+          (total-votes (+ (get votes-for report) (get votes-against report)))
+          (approval-percentage (if (> total-votes u0) 
+            (/ (* (get votes-for report) u100) total-votes) u0))
+        )
+        (and
+          (get is-emergency report)
+          (is-eq (get status report) "pending")
+          (>= approval-percentage EMERGENCY_APPROVAL_THRESHOLD)
+        )
+      )
+    false
+  )
 )
